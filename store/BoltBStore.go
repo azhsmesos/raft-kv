@@ -26,10 +26,12 @@ var (
 )
 
 type boltDBStore struct {
-	file  string
-	term  int64
-	index int64
-	db    bolt.DB
+	file            string
+	lastAppendTerm  int64
+	lastAppendIndex int64
+	lastCommitTerm  int64
+	lastCommitIndex int64
+	db              bolt.DB
 }
 
 func NewBoltStore(file string) (error, ILogStore) {
@@ -49,9 +51,9 @@ func NewBoltStore(file string) (error, ILogStore) {
 			if err != nil {
 				return err
 			}
-			store.term = defaultTerm
+			store.lastCommitTerm = defaultTerm
 		} else {
-			store.term = byteToInt64(value)
+			store.lastCommitTerm = byteToInt64(value)
 		}
 
 		value = bucket.Get(keyCommittedIndex)
@@ -60,9 +62,9 @@ func NewBoltStore(file string) (error, ILogStore) {
 			if err != nil {
 				return err
 			}
-			store.index = defaultIndex
+			store.lastCommitIndex = defaultIndex
 		} else {
-			store.index = byteToInt64(value)
+			store.lastCommitIndex = byteToInt64(value)
 		}
 
 		bucket, err = tx.CreateBucketIfNotExists(dataBucket)
@@ -102,12 +104,20 @@ func byteToInt64(data []byte) int64 {
 	return value
 }
 
-func (bt *boltDBStore) Term() int64 {
-	return bt.term
+func (bt *boltDBStore) LastCommitTerm() int64 {
+	return bt.lastCommitTerm
 }
 
-func (bt *boltDBStore) Index() int64 {
-	return bt.index
+func (bt *boltDBStore) LastCommitIndex() int64 {
+	return bt.lastCommitIndex
+}
+
+func (bt *boltDBStore) LastAppendTerm() int64 {
+	return bt.lastAppendTerm
+}
+
+func (bt *boltDBStore) LastAppendIndex() int64 {
+	return bt.lastAppendIndex
 }
 
 func (bt *boltDBStore) Append(entry *model.LogEntry) error {
@@ -123,11 +133,8 @@ func (bt *boltDBStore) Append(entry *model.LogEntry) error {
 		if err != nil {
 			return err
 		}
-		bt.index = entry.Index
-		bt.term = entry.Term
 		return nil
 	})
-	return nil
 }
 
 func (bt *boltDBStore) Commit(index int64) error {
@@ -170,6 +177,30 @@ func (bt *boltDBStore) Commit(index int64) error {
 		if err != nil {
 			return err
 		}
+		bt.lastCommitIndex = entry.Index
+		bt.lastCommitTerm = entry.Term
 		return nil
 	})
+}
+
+func (bt *boltDBStore) GetLog(index int64) (error, *model.LogEntry) {
+	ret := []*model.LogEntry{
+		nil,
+	}
+	err := bt.db.View(func(tx *bolt.Tx) error {
+		key := int64ToBytes(index)
+		value := tx.Bucket(committedBucket).Get(key)
+		if value == nil {
+			return nil
+		}
+
+		entry := new(model.LogEntry)
+		err := entry.Unmarshal(value)
+		if err != nil {
+			return err
+		}
+		ret[0] = entry
+		return nil
+	})
+	return err, ret[0]
 }
