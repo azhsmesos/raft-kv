@@ -1,104 +1,161 @@
 package core
 
 import (
-	"raft-kv/config"
+	"raft-kv/model"
+	"raft-kv/roles"
 	"raft-kv/rpc"
-	"raft-kv/util"
 	"sync"
+	"time"
 )
 
 type CandidateState struct {
-	RaftStateBase
+	model.EventDrivenModel
+	context IRaft
+
 	mInitOnce  sync.Once
 	mStartOnce sync.Once
 
-	mStateChangedHandler StateChangedHandleFunc
-	mEventMap            map[CandidateEvent][]CandidateEventHandler
+	mTerm int64
+
+	mVotedTerm int64
+
+	mVotedCandidateID string
+
+	mVotedTimestamp int64
 }
 
-type CandidateEvent int
-
 const (
-	evCandidateStart           CandidateEvent = iota
-	evCandidateElectionTimeout CandidateEvent = iota
-	evCandidateGotEnoughVotes  CandidateEvent = iota
+	ceInit            = "candidate.init"
+	ceStart           = "candidate.Start"
+	ceElectionTimeout = "cadidate.ElectionTimeout"
+	ceLeaderAnnounced = "candidate.LeaderAnounced"
+	ceVoteToCandidate = "candidate.VoteToCandidate"
+	ceDisposing       = "candidate.Disposing"
 )
 
-type CandidateEventHandler func(e CandidateEvent, args ...interface{})
-type StateChangedHandleFunc func(state IRaftState)
+func newCandidateState(ctx IRaft, term int64) IRaftState {
+	cds := new(CandidateState)
+	cds.init(ctx, term)
+	return cds
+}
+
+func (cs *CandidateState) init(ctx IRaft, term int64) {
+	cs.mInitOnce.Do(func() {
+		cs.context = ctx
+		cs.mTerm = term
+		cs.initEventHandlers()
+		cs.Raise(ceInit)
+	})
+}
+
+func (cs *CandidateState) initEventHandlers() {
+	cs.hookEventsForTerm()
+	cs.hookEventsForVotedTerm()
+	cs.hookEventsForVotedCandidateID()
+	cs.hookEventsForVotedTimestamp()
+
+	cs.Hook(ceLeaderAnnounced, cs.whenLeaderAnnouncedThenSwitchToFollower)
+	cs.Hook(ceElectionTimeout, cs.whenElectionTimeoutThenRequestVoteAgain)
+}
+
+func (cs *CandidateState) hookEventsForTerm() {
+	cs.Hook(ceElectionTimeout, func(e string, args ...interface{}) {
+		// when election timeout, term++ and request vote again
+		cs.mTerm++
+	})
+}
+
+func (cs *CandidateState) hookEventsForVotedTerm() {
+	cs.Hook(ceInit, func(e string, args ...interface{}) {
+		// 第一票投递给自己
+		cs.mVotedTerm = cs.mTerm
+	})
+
+	cs.Hook(ceElectionTimeout, func(e string, args ...interface{}) {
+		cs.mVotedTerm = cs.mTerm
+	})
+
+	cs.Hook(ceVoteToCandidate, func(e string, args ...interface{}) {
+		cmd := args[0].(*rpc.RequestVoteCmd)
+		cs.mVotedTerm = cmd.Term
+	})
+}
+
+func (cs *CandidateState) hookEventsForVotedCandidateID() {
+	cs.Hook(ceInit, func(e string, args ...interface{}) {
+		cs.mVotedCandidateID = cs.context.config().ID()
+	})
+
+	cs.Hook(ceElectionTimeout, func(e string, args ...interface{}) {
+		cs.mVotedCandidateID = cs.context.config().ID()
+	})
+
+	cs.Hook(ceVoteToCandidate, func(e string, args ...interface{}) {
+		cmd := args[0].(*rpc.RequestVoteCmd)
+		cs.mVotedCandidateID = cmd.CandidateID
+	})
+}
+
+func (cs *CandidateState) hookEventsForVotedTimestamp() {
+	cs.Hook(ceInit, func(e string, args ...interface{}) {
+		cs.mVotedTimestamp = time.Now().UnixNano()
+	})
+
+	cs.Hook(ceElectionTimeout, func(e string, args ...interface{}) {
+		cs.mVotedTimestamp = time.Now().UnixNano()
+	})
+
+	cs.Hook(ceVoteToCandidate, func(e string, args ...interface{}) {
+		cs.mVotedTimestamp = time.Now().UnixNano()
+	})
+}
+
+// whenLeaderAnnouncedThenSwitchToFollower 当leader确定后就切换成follower
+func (cs *CandidateState) whenLeaderAnnouncedThenSwitchToFollower(_ string, _ ...interface{}) {
+	cs.Raise(ceDisposing)
+	cs.context.handleStateChanged(newFollowerState(cs.context))
+}
+
+func (cs *CandidateState) whenElectionTimeoutThenRequestVoteAgain(_ string, _ ...interface{}) {
+	panic("implements me")
+}
 
 func (cs *CandidateState) Start() {
 	cs.mStartOnce.Do(func() {
-
+		cs.Raise(feStart)
 	})
 }
 
-func (cs *CandidateState) raise(ce CandidateEvent, args ...interface{}) {
-	if handlers, ok := cs.mEventMap[ce]; ok {
-		for _, it := range handlers {
-			it(ce, args)
-		}
+func (cs *CandidateState) Role() roles.RaftRole {
+	return roles.Candidate
+}
+
+func (cs *CandidateState) Heartbeat(cmd *rpc.HeartbeatCmd, ret *rpc.HeartbeatRet) error {
+	if cmd.Term <= cs.mTerm {
+		ret.Code = rpc.HBTermMismatch
+		return nil
 	}
+	cs.Raise(ceLeaderAnnounced)
+	ret.Code = rpc.HBOK
+	return nil
+}
+
+func (cs *CandidateState) AppendLog(cmd *rpc.AppendLogCmd, ret *rpc.AppendLogRet) error {
+	if cmd.Term <= cs.mTerm {
+		ret.Code = rpc.ALTermMismatch
+		return nil
+	}
+	cs.Raise(ceLeaderAnnounced)
+	ret.Code = rpc.ALInternalError
+	return nil
+}
+
+func (cs *CandidateState) CommitLog(cmd *rpc.CommitLogCmd, ret *rpc.CommitLogRet) error {
+	// ignore and return
+	ret.Code = rpc.CLInternalError
+	return nil
 }
 
 func (cs *CandidateState) RequestVote(cmd *rpc.RequestVoteCmd, ret *rpc.RequestVoteRet) error {
-	return util.ErrorCandidateWontReplyRequestVote
-}
-
-func (cs *CandidateState) AppendEntries(cmd *rpc.AppendEntriesCmd, ret *rpc.AppendEntriesRet) error {
-	return util.ErrorCandidateWontReplyAppendEntries
-}
-
-func (cs *CandidateState) StateChangeHandler(handler StateChangedHandleFunc) {
-	cs.mStateChangedHandler = handler
-}
-
-func newCandidateState(cfg config.IRaftConfig, term int, handler StateChangedHandleFunc) *CandidateState {
-	cs := new(CandidateState)
-	cs.init(cfg, term, handler)
-	return cs
-}
-
-func (cs *CandidateState) init(cfg config.IRaftConfig, term int, handler StateChangedHandleFunc) {
-	cs.mInitOnce.Do(func() {
-		cs.cfg = cfg
-		cs.term = term
-		cs.mStateChangedHandler = handler
-
-		cs.mEventMap = make(map[CandidateEvent][]CandidateEventHandler)
-		cs.registerEventHandlers()
-	})
-}
-
-func (cs *CandidateState) registerEventHandlers() {
-	cs.mEventMap[evCandidateStart] = []CandidateEventHandler{
-		cs.whenStartThenRequestVote,
-		cs.whenStartThenWatchElectionTimeout,
-	}
-	cs.mEventMap[evCandidateElectionTimeout] = []CandidateEventHandler{
-		cs.whenElectionTimeoutThenRequestVoteAgain,
-	}
-	cs.mEventMap[evCandidateGotEnoughVotes] = []CandidateEventHandler{
-		cs.whenGotEnoughVotesThenSwitchToLeader,
-	}
-}
-
-// whenStartThenRequestVote candidate启动后就请求投票
-func (cs *CandidateState) whenStartThenRequestVote(_ CandidateEvent, _ ...interface{}) {
-
-}
-
-// whenStartThenWatchElectionTimeout watch leader 选举超时
-func (cs *CandidateState) whenStartThenWatchElectionTimeout(_ CandidateEvent, _ ...interface{}) {
-
-}
-
-// whenElectionTimeoutThenRequestVoteAgain leader选举超时重新选举
-func (cs *CandidateState) whenElectionTimeoutThenRequestVoteAgain(_ CandidateEvent, _ ...interface{}) {
-
-}
-
-// whenGotEnoughVotesThenSwitchToLeader 当获取到足够票数时，就切换到leader
-func (cs *CandidateState) whenGotEnoughVotesThenSwitchToLeader(_ CandidateEvent, _ ...interface{}) {
-
+	panic("")
 }
